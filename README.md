@@ -1,11 +1,12 @@
-# Podkop Domain Capture
+# Domain Catcher
 
 ![OpenWrt](https://img.shields.io/badge/OpenWrt-BusyBox%20ash-00B5E2)
 ![Dependencies](https://img.shields.io/badge/dependencies-tcpdump--mini%20%2B%20nft-orange)
-![Version](https://img.shields.io/badge/version-0.4.2--beta-blue)
+![Version](https://img.shields.io/badge/version-0.5.0--beta-blue)
 
 SSH-утилита для OpenWrt: показывает, к каким доменам обращается устройство в сети,
-чтобы добавить их в Podkop. Домены берутся из двух источников сразу:
+чтобы добавить их в правила раздельной маршрутизации - PassWall2, Podkop, NetShift
+или любого другого прокси-клиента. Домены берутся из двух источников сразу:
 
 - **DNS** - лог запросов `dnsmasq`;
 - **SNI** - имя сервера из TLS ClientHello, снятое с LAN-интерфейса.
@@ -15,10 +16,10 @@ SSH-утилита для OpenWrt: показывает, к каким доме�
 ## 🚀 Установка
 
 ```sh
-wget -O /usr/bin/.pdc.new https://raw.githubusercontent.com/doxfie/Podkop-Domain-Capture/main/podkop-domain-capture.sh && tail -n1 /usr/bin/.pdc.new | grep -qx '# PDC-EOF' && chmod +x /usr/bin/.pdc.new && mv /usr/bin/.pdc.new /usr/bin/pdc && pdc
+wget -O /usr/bin/.dcatch.new https://raw.githubusercontent.com/doxfie/Domain-Catcher/main/domain-catcher.sh && tail -n1 /usr/bin/.dcatch.new | grep -qx '# DCATCH-EOF' && chmod +x /usr/bin/.dcatch.new && mv /usr/bin/.dcatch.new /usr/bin/dcatch && dcatch
 ```
 
-Установка нужна один раз. Дальше утилита запускается командой `pdc` - она же
+Установка нужна один раз. Дальше утилита запускается командой `dcatch` - она же
 открывает меню при каждом следующем запуске.
 
 ---
@@ -69,14 +70,14 @@ wget -O /usr/bin/.pdc.new https://raw.githubusercontent.com/doxfie/Podkop-Domain
 
 ### Временные правила
 
-На время сбора поднимается отдельная nft-таблица `inet pdc_capture`:
+На время сбора поднимается отдельная nft-таблица `inet dcatch_capture`:
 
 - **перехват DNS** - `redirect` порта 53 клиента на роутер, ловит хардкод вроде `8.8.8.8`;
 - **блок DoT** - закрывает :853;
 - **блок QUIC** - закрывает udp:443, иначе ClientHello зашифрован и SNI не прочитать.
 
-`fw4`, `podkop` и `zapret` она не задевает и снимается сама - при остановке сбора,
-по `Ctrl+C` и при выходе. Если всё же осталась: `nft delete table inet pdc_capture`.
+`fw4`, PassWall2, Podkop и `zapret` она не задевает и снимается сама - при остановке
+сбора, по `Ctrl+C` и при выходе. Если всё же осталась: `nft delete table inet dcatch_capture`.
 
 Отключить правила можно в «Настройках сбора», там же выбор одного источника.
 
@@ -84,7 +85,7 @@ wget -O /usr/bin/.pdc.new https://raw.githubusercontent.com/doxfie/Podkop-Domain
 
 ## 📝 Лог
 
-`/tmp/podkop-domain-capture.log`, формат `HH:MM:SS IP DOMAIN SRC`, где `SRC` -
+`/tmp/domain-catcher.log`, формат `HH:MM:SS IP DOMAIN SRC`, где `SRC` -
 `dns` или `sni`. `dnsmasq logqueries` включается только на время сбора и
 возвращается в исходное состояние.
 
@@ -106,7 +107,7 @@ GitHub и обновляет `tcpdump-mini`. Новая версия стави�
 репозиторий вашей версии OpenWrt уехал в архив, - остаётся сбор только по DNS:
 
 ```sh
-PDC_SOURCE=dns pdc
+DCATCH_SOURCE=dns dcatch
 ```
 
 ---

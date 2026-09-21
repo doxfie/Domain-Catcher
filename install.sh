@@ -1,20 +1,20 @@
 #!/bin/ash
 
-# Установщик Podkop Domain Capture для OpenWrt / BusyBox ash.
-# Скачивает основной скрипт в /usr/bin/pdc и сразу запускает его.
+# Установщик Domain Catcher для OpenWrt / BusyBox ash.
+# Скачивает основной скрипт в /usr/bin/dcatch и сразу запускает его.
 
-SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/doxfie/Podkop-Domain-Capture/main/podkop-domain-capture.sh}"
-TARGET="${TARGET:-/usr/bin/pdc}"
-EOF_MARK="# PDC-EOF"
+SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/doxfie/Domain-Catcher/main/domain-catcher.sh}"
+TARGET="${TARGET:-/usr/bin/dcatch}"
+EOF_MARK="# DCATCH-EOF"
 
-echo "Podkop Domain Capture installer"
+echo "Domain Catcher installer"
 echo "Скачиваю скрипт:"
 echo "$SCRIPT_URL"
 echo
 
 if ! command -v wget >/dev/null 2>&1; then
 	echo "Ошибка: wget не найден."
-	echo "Установите wget или скачайте podkop-domain-capture.sh вручную."
+	echo "Установите wget или скачайте domain-catcher.sh вручную."
 	exit 1
 fi
 
@@ -27,7 +27,7 @@ fail() {
 # Качаем рядом с целевым файлом и подменяем переименованием: прямая запись
 # в "$TARGET" при обрыве связи оставила бы обрезанный исполняемый файл вместо
 # рабочей установки, а mv в пределах одной ФС атомарен.
-NEW_FILE="$(dirname "$TARGET")/.pdc.new"
+NEW_FILE="$(dirname "$TARGET")/.dcatch.new"
 rm -f "$NEW_FILE"
 
 wget -O "$NEW_FILE" "$SCRIPT_URL" || fail "не удалось скачать скрипт."
@@ -43,7 +43,7 @@ mv "$NEW_FILE" "$TARGET" || fail "не удалось установить ск�
 
 echo
 echo "Скрипт установлен: $TARGET"
-echo "Повторный запуск: pdc"
+echo "Повторный запуск: dcatch"
 echo "Запускаю..."
 echo
 
@@ -51,4 +51,4 @@ echo
 [ -c /dev/tty ] && exec "$TARGET" < /dev/tty
 
 echo "Интерактивный ввод недоступен."
-echo "Запустите скрипт вручную: pdc"
+echo "Запустите скрипт вручную: dcatch"

@@ -1,42 +1,44 @@
 #!/bin/ash
 
-# Сбор доменов, к которым обращаются клиенты сети, для добавления в Podkop.
+# Сбор доменов, к которым обращаются клиенты сети, для правил раздельной
+# маршрутизации: PassWall2, Podkop, NetShift и любых других.
 # Совместимо с OpenWrt BusyBox ash: bash-специфичного синтаксиса нет.
 
-LOG_FILE="/tmp/podkop-domain-capture.log"
-PREV_FILE="/tmp/podkop-domain-capture.logqueries.prev"
+LOG_FILE="/tmp/domain-catcher.log"
+PREV_FILE="/tmp/domain-catcher.logqueries.prev"
 LEASES_FILE="/tmp/dhcp.leases"
-CLIENTS_FILE="/tmp/podkop-domain-capture.clients"
-LOG_IPS_FILE="/tmp/podkop-domain-capture.log-ips"
-SNI_AWK_FILE="/tmp/podkop-domain-capture.sni.awk"
-SNI_PID_FILE="/tmp/podkop-domain-capture.tcpdump.pid"
-SNI_ERR_FILE="/tmp/podkop-domain-capture.tcpdump.err"
-DNS_PID_FILE="/tmp/podkop-domain-capture.logread.pid"
-NFT_FILE="/tmp/podkop-domain-capture.nft"
+CLIENTS_FILE="/tmp/domain-catcher.clients"
+LOG_IPS_FILE="/tmp/domain-catcher.log-ips"
+SNI_AWK_FILE="/tmp/domain-catcher.sni.awk"
+SNI_PID_FILE="/tmp/domain-catcher.tcpdump.pid"
+SNI_ERR_FILE="/tmp/domain-catcher.tcpdump.err"
+DNS_PID_FILE="/tmp/domain-catcher.logread.pid"
+NFT_FILE="/tmp/domain-catcher.nft"
 TTY_DEV="/dev/tty"
-PDC_VERSION="0.4.2-beta"
+DCATCH_VERSION="0.5.0-beta"
 
 # Обновляемся по последнему релизу, а не по ветке: в ветку попадает и работа
-# в процессе. PDC_SCRIPT_URL перекрывает всё и берёт файл напрямую.
-SCRIPT_REPO="${PDC_SCRIPT_REPO:-doxfie/Podkop-Domain-Capture}"
-SCRIPT_FILE="podkop-domain-capture.sh"
-SCRIPT_URL="${PDC_SCRIPT_URL:-}"
+# в процессе. DCATCH_SCRIPT_URL перекрывает всё и берёт файл напрямую.
+SCRIPT_REPO="${DCATCH_SCRIPT_REPO:-doxfie/Domain-Catcher}"
+SCRIPT_FILE="domain-catcher.sh"
+SCRIPT_URL="${DCATCH_SCRIPT_URL:-}"
 RELEASE_API="https://api.github.com/repos/$SCRIPT_REPO/releases/latest"
-UPDATE_STAMP="/etc/podkop-domain-capture.stamp"
+UPDATE_STAMP="/etc/domain-catcher.stamp"
 UPDATE_INTERVAL="86400"
 # Маркер конца файла: по нему видно, что закачка дошла до конца, а не оборвалась.
-EOF_MARK="# PDC-EOF"
+EOF_MARK="# DCATCH-EOF"
 TCPDUMP_PKG="tcpdump-mini"
 TCPDUMP_SIZE="~385 КБ"
 MAINTENANCE_NOTED="0"
 
-# Отдельная таблица, чтобы не трогать fw4/podkop/zapret и снимать всё разом.
-NFT_TABLE="pdc_capture"
+# Отдельная таблица: чужие (fw4, PassWall2, Podkop, zapret) не трогаем,
+# а свою снимаем разом.
+NFT_TABLE="dcatch_capture"
 
-# PDC_SOURCE=dns запускает утилиту без требования tcpdump - нужно, когда пакет
+# DCATCH_SOURCE=dns запускает утилиту без требования tcpdump - нужно, когда пакет
 # принципиально не поставить. Умолчание не меняется: без переменной отсутствие
 # tcpdump останавливает запуск, чтобы сбор молча не деградировал.
-CAPTURE_SOURCE="${PDC_SOURCE:-both}"
+CAPTURE_SOURCE="${DCATCH_SOURCE:-both}"
 case "$CAPTURE_SOURCE" in
 	dns|sni|both) ;;
 	*) CAPTURE_SOURCE="both" ;;
@@ -89,7 +91,7 @@ ensure_interactive_input() {
 
 	echo "Интерактивный ввод недоступен."
 	echo "Не запускайте меню через pipe вида: wget -O - ... | sh"
-	echo "Запустите скрипт напрямую: pdc"
+	echo "Запустите скрипт напрямую: dcatch"
 	exit 1
 }
 
@@ -196,7 +198,7 @@ show_tui_unsupported() {
 tui_header() {
 	clear_screen
 	printf '%s%s%s\n' "$TUI_CYAN" "$TUI_LINE" "$TUI_RESET"
-	printf '%s%s%s %s[%s]%s\n' "$TUI_BOLD" "$TUI_GREEN" "$1" "$TUI_DIM" "$PDC_VERSION" "$TUI_RESET"
+	printf '%s%s%s %s[%s]%s\n' "$TUI_BOLD" "$TUI_GREEN" "$1" "$TUI_DIM" "$DCATCH_VERSION" "$TUI_RESET"
 	[ -n "$2" ] && printf '%s%s%s\n' "$TUI_DIM" "$2" "$TUI_RESET"
 	printf '%s%s%s\n\n' "$TUI_CYAN" "$TUI_LINE" "$TUI_RESET"
 }
@@ -232,7 +234,7 @@ render_menu_line() {
 }
 
 render_main_menu() {
-	tui_header "Podkop Domain Capture" "Сбор доменов из DNS-лога и TLS ClientHello"
+	tui_header "Domain Catcher" "Сбор доменов из DNS-лога и TLS ClientHello"
 	tui_hint "Стрелки вверх/вниз - выбор   Enter - открыть   q - выход"
 	echo
 	tui_section "Действия"
@@ -554,7 +556,7 @@ expand_selected_clients() {
 # Парсер TLS ClientHello держим отдельным файлом, а не inline-строкой: так
 # проще отлаживать и не воевать с экранированием внутри ash.
 write_sni_awk() {
-	cat > "$SNI_AWK_FILE" <<'PDC_SNI_AWK'
+	cat > "$SNI_AWK_FILE" <<'DCATCH_SNI_AWK'
 function hv(c) { return index("0123456789abcdef", c) - 1 }
 
 function b(i,	s) {
@@ -656,10 +658,10 @@ function flush(	ver, tcp, doff, p, n, sidl, csl, cml, extl, et, el, end, nl, nam
 }
 
 END { if (!DONE) flush() }
-PDC_SNI_AWK
+DCATCH_SNI_AWK
 }
 
-# Обычный запуск - это "pdc" по имени из PATH, и тогда в $0 нет ни одного
+# Обычный запуск - это "dcatch" по имени из PATH, и тогда в $0 нет ни одного
 # слэша: клеить его с текущим каталогом нельзя, надо искать в PATH.
 self_path() {
 	case "$0" in
@@ -753,12 +755,12 @@ install_tcpdump_or_die() {
 	[ -n "$INSTALL_OUT" ] && printf '%s\n' "$INSTALL_OUT" | tail -5
 	echo
 	echo "Сбор по SNI - основной режим, без tcpdump он невозможен."
-	echo "Проверьте интернет и свободное место, затем запустите pdc снова."
+	echo "Проверьте интернет и свободное место, затем запустите dcatch снова."
 	echo
 	echo "Если пакет не поставить в принципе - например, релиз OpenWrt уехал"
 	echo "в архив и фид отдаёт 404, - можно собирать только по DNS:"
 	echo
-	echo "    PDC_SOURCE=dns pdc"
+	echo "    DCATCH_SOURCE=dns dcatch"
 	echo
 	echo "Учтите: без SNI в список не попадут домены с закешированным ответом,"
 	echo "клиенты со своим DoH/DoT и с зашитым в прошивку IP."
@@ -789,7 +791,7 @@ update_tcpdump() {
 
 # jsonfilter входит в базовый OpenWrt, но если его нет - берём поле grep'ом.
 latest_release_tag() {
-	TAG_FILE="/tmp/podkop-domain-capture.release"
+	TAG_FILE="/tmp/domain-catcher.release"
 	rm -f "$TAG_FILE"
 	fetch_url "$RELEASE_API" "$TAG_FILE" || { rm -f "$TAG_FILE"; return 1; }
 
@@ -814,14 +816,14 @@ update_script() {
 	else
 		RELEASE_TAG="$(latest_release_tag)" || return 0
 		# Тег вида v0.4.0-beta: сверяем без "v" и не качаем лишнего.
-		version_newer "${RELEASE_TAG#v}" "$PDC_VERSION" || return 0
+		version_newer "${RELEASE_TAG#v}" "$DCATCH_VERSION" || return 0
 		SRC_URL="https://raw.githubusercontent.com/$SCRIPT_REPO/$RELEASE_TAG/$SCRIPT_FILE"
 	fi
 
 	# Временный файл кладём рядом с целевым: mv в пределах одной ФС - это
 	# rename(2). Из /tmp (tmpfs) в /usr/bin (overlay) busybox копировал бы
 	# содержимое, то есть переписывал бы исполняемый прямо сейчас файл.
-	NEW_FILE="$(dirname "$SELF")/.podkop-domain-capture.new"
+	NEW_FILE="$(dirname "$SELF")/.domain-catcher.new"
 	rm -f "$NEW_FILE"
 	fetch_url "$SRC_URL" "$NEW_FILE" || { rm -f "$NEW_FILE"; return 0; }
 
@@ -830,13 +832,13 @@ update_script() {
 		return 0
 	fi
 
-	REMOTE_VERSION="$(grep -m1 '^PDC_VERSION=' "$NEW_FILE" | cut -d'"' -f2)"
-	if [ -z "$REMOTE_VERSION" ] || ! version_newer "$REMOTE_VERSION" "$PDC_VERSION"; then
+	REMOTE_VERSION="$(grep -m1 '^DCATCH_VERSION=' "$NEW_FILE" | cut -d'"' -f2)"
+	if [ -z "$REMOTE_VERSION" ] || ! version_newer "$REMOTE_VERSION" "$DCATCH_VERSION"; then
 		rm -f "$NEW_FILE"
 		return 0
 	fi
 
-	echo "Доступна версия $REMOTE_VERSION (установлена $PDC_VERSION), обновляю..."
+	echo "Доступна версия $REMOTE_VERSION (установлена $DCATCH_VERSION), обновляю..."
 	chmod +x "$NEW_FILE" 2>/dev/null
 
 	# Подменяем переименованием, а не перезаписью: работающий шелл продолжит
@@ -848,7 +850,7 @@ update_script() {
 	fi
 
 	echo "Обновлено до $REMOTE_VERSION, перезапускаю..."
-	PDC_UPDATED=1 exec "$SELF"
+	DCATCH_UPDATED=1 exec "$SELF"
 }
 
 update_due() {
@@ -867,7 +869,7 @@ startup_maintenance() {
 		install_tcpdump_or_die
 		date +%s > "$UPDATE_STAMP" 2>/dev/null
 	# Уже перезапускались после обновления - второй круг не нужен.
-	elif [ -z "$PDC_UPDATED" ] && update_due; then
+	elif [ -z "$DCATCH_UPDATED" ] && update_due; then
 		echo "Проверяю обновления..."
 		date +%s > "$UPDATE_STAMP" 2>/dev/null
 		command -v tcpdump >/dev/null 2>&1 && update_tcpdump
@@ -952,26 +954,26 @@ nft_guard_enable() {
 	{
 		printf 'table inet %s {\n' "$NFT_TABLE"
 		if [ "$OPT_DNS_HIJACK" = "1" ]; then
-			printf '\tchain pdc_nat_pre {\n'
+			printf '\tchain dcatch_nat_pre {\n'
 			printf '\t\ttype nat hook prerouting priority dstnat - 5; policy accept;\n'
 			for ONE in $NFT_SRC_LIST; do
 				FAM="$(nft_family "$ONE")"
-				printf '\t\t%s saddr %s udp dport 53 counter redirect to :53 comment "pdc-dns-hijack"\n' "$FAM" "$ONE"
-				printf '\t\t%s saddr %s tcp dport 53 counter redirect to :53 comment "pdc-dns-hijack"\n' "$FAM" "$ONE"
+				printf '\t\t%s saddr %s udp dport 53 counter redirect to :53 comment "dcatch-dns-hijack"\n' "$FAM" "$ONE"
+				printf '\t\t%s saddr %s tcp dport 53 counter redirect to :53 comment "dcatch-dns-hijack"\n' "$FAM" "$ONE"
 			done
 			printf '\t}\n'
 		fi
 		if [ "$OPT_BLOCK_DOT" = "1" ] || [ "$OPT_BLOCK_QUIC" = "1" ]; then
-			printf '\tchain pdc_fwd {\n'
+			printf '\tchain dcatch_fwd {\n'
 			printf '\t\ttype filter hook forward priority filter - 5; policy accept;\n'
 			for ONE in $NFT_SRC_LIST; do
 				FAM="$(nft_family "$ONE")"
 				if [ "$OPT_BLOCK_DOT" = "1" ]; then
-					printf '\t\t%s saddr %s tcp dport 853 counter reject with tcp reset comment "pdc-block-dot"\n' "$FAM" "$ONE"
-					printf '\t\t%s saddr %s udp dport 853 counter drop comment "pdc-block-dot"\n' "$FAM" "$ONE"
+					printf '\t\t%s saddr %s tcp dport 853 counter reject with tcp reset comment "dcatch-block-dot"\n' "$FAM" "$ONE"
+					printf '\t\t%s saddr %s udp dport 853 counter drop comment "dcatch-block-dot"\n' "$FAM" "$ONE"
 				fi
 				[ "$OPT_BLOCK_QUIC" = "1" ] &&
-					printf '\t\t%s saddr %s udp dport 443 counter drop comment "pdc-block-quic"\n' "$FAM" "$ONE"
+					printf '\t\t%s saddr %s udp dport 443 counter drop comment "dcatch-block-quic"\n' "$FAM" "$ONE"
 			done
 			printf '\t}\n'
 		fi
@@ -1222,7 +1224,7 @@ configure_capture_advanced() {
 		3) CAPTURE_SOURCE="sni" ;;
 	esac
 
-	# Утилиту могли запустить с PDC_SOURCE=dns именно потому, что пакета нет.
+	# Утилиту могли запустить с DCATCH_SOURCE=dns именно потому, что пакета нет.
 	if [ "$CAPTURE_SOURCE" != "dns" ] && ! command -v tcpdump >/dev/null 2>&1; then
 		echo
 		tui_message "tcpdump не установлен, источник SNI недоступен - остаётся DNS."
@@ -1506,7 +1508,7 @@ cleanup() {
 	tui_section "Будет выполнено"
 	echo "   Вернуть dnsmasq logqueries в состояние до сбора."
 	echo "   Удалить последний live-лог: $LOG_FILE"
-	echo "   Удалить служебные файлы pdc в /tmp."
+	echo "   Удалить служебные файлы dcatch в /tmp."
 	echo "   Перезапустить RAM-log роутера."
 	echo
 	tui_section "Не выполняется"
@@ -1581,4 +1583,4 @@ while :; do
 	esac
 done
 
-# PDC-EOF
+# DCATCH-EOF
