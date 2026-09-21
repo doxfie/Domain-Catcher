@@ -1570,13 +1570,6 @@ capture_stream() {
 		fi
 	fi
 
-	if [ "$CAPTURE_SOURCE" != "dns" ]; then
-		tui_hint "TLS: ok - прошло, drop - нет ответа ${TLS_TIMEOUT} с, rst - сброс, tspu? - сброс похож на ТСПУ,"
-		tui_hint "     alert - отказ сервера, fin - закрыто без ответа, abort - клиент закрыл сам,"
-		tui_hint "     * - соединение принял прокси на роутере. Строка SNI появляется, когда исход известен."
-		echo
-	fi
-
 	# SRC и TLS перед доменом: домен последний, поэтому его длина никому не мешает.
 	printf "%-8s %-${CLIENT_COL_W}s %-3s %-6s %s\n" "TIME" "CLIENT_IP" "SRC" "TLS" "DOMAIN"
 	printf '%s %s %s %s %s\n' "$(dashes 8)" "$(dashes "$CLIENT_COL_W")" "---" "$(dashes 6)" "$(dashes 40)"
