@@ -11,11 +11,12 @@ CLIENTS_FILE="/tmp/domain-catcher.clients"
 LOG_IPS_FILE="/tmp/domain-catcher.log-ips"
 SNI_AWK_FILE="/tmp/domain-catcher.sni.awk"
 SNI_PID_FILE="/tmp/domain-catcher.tcpdump.pid"
+SNI_TICK_PID_FILE="/tmp/domain-catcher.tick.pid"
 SNI_ERR_FILE="/tmp/domain-catcher.tcpdump.err"
 DNS_PID_FILE="/tmp/domain-catcher.logread.pid"
 NFT_FILE="/tmp/domain-catcher.nft"
 TTY_DEV="/dev/tty"
-DCATCH_VERSION="0.5.0-beta"
+DCATCH_VERSION="0.6.0-beta"
 
 # Обновляемся по последнему релизу, а не по ветке: в ветку попадает и работа
 # в процессе. DCATCH_SCRIPT_URL перекрывает всё и берёт файл напрямую.
@@ -44,6 +45,13 @@ case "$CAPTURE_SOURCE" in
 	*) CAPTURE_SOURCE="both" ;;
 esac
 
+# Сколько секунд ждать ответа сервера на ClientHello, прежде чем считать
+# соединение молча отброшенным. Обычный сервер отвечает за доли секунды.
+TLS_TIMEOUT="${DCATCH_TLS_TIMEOUT:-5}"
+case "$TLS_TIMEOUT" in
+	''|*[!0-9]*|0) TLS_TIMEOUT="5" ;;
+esac
+
 OPT_DNS_HIJACK="1"
 OPT_BLOCK_DOT="1"
 OPT_BLOCK_QUIC="1"
@@ -67,7 +75,7 @@ LOGS_ENABLED="0"
 TUI_LINE="---------------------------------------------------------"
 if [ -n "$NO_COLOR" ]; then
 	TUI_RESET=""; TUI_BOLD=""; TUI_DIM=""
-	TUI_GREEN=""; TUI_CYAN=""; TUI_YELLOW=""; TUI_SELECTED=""
+	TUI_GREEN=""; TUI_CYAN=""; TUI_YELLOW=""; TUI_RED=""; TUI_SELECTED=""
 else
 	TUI_RESET="$(printf '\033[0m')"
 	TUI_BOLD="$(printf '\033[1m')"
@@ -75,6 +83,7 @@ else
 	TUI_GREEN="$(printf '\033[32m')"
 	TUI_CYAN="$(printf '\033[36m')"
 	TUI_YELLOW="$(printf '\033[33m')"
+	TUI_RED="$(printf '\033[31m')"
 	TUI_SELECTED="$(printf '\033[1;30;42m')"
 fi
 
@@ -553,10 +562,18 @@ expand_selected_clients() {
 	return 0
 }
 
-# Парсер TLS ClientHello держим отдельным файлом, а не inline-строкой: так
+# Разбор TLS-рукопожатий держим отдельным файлом, а не inline-строкой: так
 # проще отлаживать и не воевать с экранированием внутри ash.
 write_sni_awk() {
 	cat > "$SNI_AWK_FILE" <<'DCATCH_SNI_AWK'
+# На входе вывод tcpdump -x и строки "TICK HH:MM:SS" раз в секунду.
+# На выходе по строке на соединение, когда исход рукопожатия уже известен:
+#   HH:MM:SS CLIENT DOMAIN sni STATUS VIA
+# STATUS: ok | alert | rst | tspu | fin | drop | abort | -
+# VIA:    router - соединение принял сам роутер (прозрачный прокси),
+#         direct - ответ пришёл снаружи, "-" - судить не по чему.
+# Побитовых операций в busybox awk нет, флаги TCP разбираем делением.
+
 function hv(c) { return index("0123456789abcdef", c) - 1 }
 
 function b(i,	s) {
@@ -571,77 +588,208 @@ function b2(i,	h, l) {
 	return h * 256 + l
 }
 
-# Возвращает 1, если имя найдено и напечатано. Зовём после каждой строки с
-# байтами: иначе домен появлялся бы лишь со следующим TLS-соединением.
-function flush(	ver, tcp, doff, p, n, sidl, csl, cml, extl, et, el, end, nl, name, i, c) {
-	if (HEX == "" || SRC == "") return 0
-	if (b(0) < 0) return 0
+function bit(x, n,	i) {
+	for (i = 0; i < n; i++) x = int(x / 2)
+	return x % 2
+}
 
-	ver = int(b(0) / 16)
-	if (ver == 4) {
-		if (b(9) != 6) return 0			# protocol = TCP
-		tcp = (b(0) % 16) * 4			# IHL в 32-битных словах
-	} else if (ver == 6) {
-		if (b(6) != 6) return 0			# next header = TCP, без расширений
-		tcp = 40				# заголовок IPv6 фиксирован
-	} else {
-		return 0
-	}
+# "HH:MM:SS[.дробь]" в секунды от полуночи.
+function tsec(s,	a) {
+	split(s, a, ":")
+	return a[1] * 3600 + a[2] * 60 + a[3]
+}
 
-	doff = int(b(tcp + 12) / 16) * 4
-	if (doff < 20) return 0
-	p = tcp + doff
-	if (b(p) != 22) return 0		# TLS handshake
-	if (b(p + 5) != 1) return 0		# ClientHello
+# Разница во времени с переходом через полночь.
+function since(t0, t1,	d) {
+	d = t1 - t0
+	if (d < -43200) d += 86400
+	return d
+}
 
+function addr(ep,	a) {
+	a = ep
+	sub(/\.[0-9]+$/, "", a)
+	return a
+}
+
+# Имя из ClientHello, начинающегося с байта p. "" - имени нет или не хватает
+# байтов: тогда разбор повторится со следующей строкой дампа.
+function sni_name(p,	n, sidl, csl, cml, extl, et, el, end, nl, name, i, c) {
 	# 5 record + 4 handshake + 2 version + 32 random = 43
 	n = p + 43
-	sidl = b(n); if (sidl < 0) return 0
+	sidl = b(n); if (sidl < 0) return ""
 	n += 1 + sidl
-	csl = b2(n); if (csl < 0) return 0
+	csl = b2(n); if (csl < 0) return ""
 	n += 2 + csl
-	cml = b(n); if (cml < 0) return 0
+	cml = b(n); if (cml < 0) return ""
 	n += 1 + cml
-	extl = b2(n); if (extl < 0) return 0
+	extl = b2(n); if (extl < 0) return ""
 	n += 2
 	end = n + extl
 
 	while (n + 4 <= end) {
 		et = b2(n); el = b2(n + 2)
-		if (et < 0 || el < 0) return 0
+		if (et < 0 || el < 0) return ""
 		n += 4
 		if (et == 0) {
 			nl = b2(n + 3)
-			if (nl <= 0 || nl > 253) return 0
+			if (nl <= 0 || nl > 253) return ""
 			# Имя обязано умещаться в расширение: список (2) + тип (1) +
 			# длина (2) + имя. Иначе разбор уполз бы в соседнее.
-			if (nl + 5 > el) return 0
+			if (nl + 5 > el) return ""
 			name = ""
 			for (i = 0; i < nl; i++) {
 				c = b(n + 5 + i)
-				if (c < 33 || c > 126) return 0
+				if (c < 33 || c > 126) return ""
 				name = name sprintf("%c", c)
 			}
-			printf "%s %s %s sni\n", TS, SRC, name
-			fflush()
-			return 1
+			return name
 		}
 		n += el
 	}
-	return 0
+	return ""
+}
+
+# Пакет, рождённый на самом роутере, уходит в LAN с TTL ровно 64. От внешнего
+# сервера после форварда приходит не больше 63: роутер уменьшил его сам.
+# TTL из SYN-ACK надёжнее - он точно от того, кто принял соединение.
+function via_of(k, ttl) {
+	if (k in STTL) ttl = STTL[k]
+	if (ttl == "") return "-"
+	return ttl == 64 ? "router" : "direct"
+}
+
+function forget(k) {
+	delete PT[k]; delete PTS[k]; delete PCL[k]; delete PNAME[k]
+	delete SYNT[k]; delete RTT[k]; delete STTL[k]
+}
+
+function emit(k, st, via) {
+	printf "%s %s %s sni %s %s\n", PTS[k], PCL[k], PNAME[k], st, via
+	fflush()
+	forget(k)
+}
+
+# RST вместо ответа сервера. Подменный RST от ТСПУ выдают две вещи: он
+# приходит быстрее, чем сервер успел бы ответить, и его TTL не совпадает
+# с TTL настоящих пакетов сервера - инжектор стоит ближе. Сравнивать есть
+# с чем, только если видели SYN-ACK, и только когда его прислал не роутер.
+function rst_status(k, ttl, t,	d) {
+	if (!(k in STTL) || STTL[k] == 64) return "rst"
+	d = ttl - STTL[k]
+	if (d > 1 || d < -1) return "tspu"
+	if ((k in RTT) && RTT[k] >= 0.01 && since(PT[k], t) < RTT[k] / 2) return "tspu"
+	return "rst"
+}
+
+# 1 - пакет разобран или неинтересен, 0 - нужны ещё байты.
+function classify(	ver, tcp, ttl, total, flags, doff, p, plen, t, fwd, rev, rec, hs, name) {
+	if (HEX == "" || SA == "") return 1
+	if (b(0) < 0) return 0
+
+	ver = int(b(0) / 16)
+	if (ver == 4) {
+		if (b(9) < 0) return 0
+		if (b(9) != 6) return 1			# protocol = TCP
+		tcp = (b(0) % 16) * 4			# IHL в 32-битных словах
+		ttl = b(8)
+		total = b2(2)
+	} else if (ver == 6) {
+		if (b(7) < 0) return 0
+		if (b(6) != 6) return 1			# next header = TCP, без расширений
+		tcp = 40				# заголовок IPv6 фиксирован
+		ttl = b(7)				# hop limit
+		total = b2(4) + 40
+	} else {
+		return 1
+	}
+
+	flags = b(tcp + 13)
+	if (flags < 0) return 0
+	doff = int(b(tcp + 12) / 16) * 4
+	if (doff < 20) return 1
+	p = tcp + doff
+	plen = total - p
+
+	t = tsec(TSF)
+	fwd = SA ">" DA
+	rev = DA ">" SA
+
+	# SYN без ACK: клиент открывает соединение, засекаем время для RTT.
+	if (bit(flags, 1) && !bit(flags, 4)) {
+		SYNT[fwd] = t
+		return 1
+	}
+	# SYN-ACK: RTT до сервера и его TTL - эталон для проверки RST.
+	if (bit(flags, 1)) {
+		if (rev in SYNT) {
+			RTT[rev] = since(SYNT[rev], t)
+			STTL[rev] = ttl
+		}
+		return 1
+	}
+
+	# Ответ на наш ClientHello.
+	if (rev in PT) {
+		if (bit(flags, 2)) {
+			emit(rev, rst_status(rev, ttl, t), via_of(rev, ttl))
+			return 1
+		}
+		if (plen > 0) {
+			rec = b(p); hs = b(p + 5)
+			if (rec < 0 || hs < 0) return 0
+			if (rec == 22 && hs == 2) { emit(rev, "ok", via_of(rev, ttl)); return 1 }
+			if (rec == 21) { emit(rev, "alert", via_of(rev, ttl)); return 1 }
+		}
+		if (bit(flags, 0)) emit(rev, "fin", via_of(rev, ttl))
+		return 1
+	}
+
+	# Клиент сам закрыл соединение, не дождавшись ответа, - это не блокировка.
+	if (fwd in PT) {
+		if (bit(flags, 0) || bit(flags, 2)) emit(fwd, "abort", via_of(fwd, ""))
+		return 1
+	}
+
+	if (plen <= 0) return 1
+	rec = b(p); hs = b(p + 5)
+	if (rec < 0 || hs < 0) return 0
+	if (rec != 22 || hs != 1) return 1	# не ClientHello
+
+	name = sni_name(p)
+	if (name == "") return 0
+
+	PT[fwd] = t
+	PTS[fwd] = substr(TSF, 1, 8)
+	PCL[fwd] = addr(SA)
+	PNAME[fwd] = name
+	return 1
+}
+
+# Тикер нужен, чтобы таймаут срабатывал и в тишине: сам tcpdump при
+# заблокированном соединении ничего нового не пришлёт.
+/^TICK / {
+	now = tsec($2)
+	n = 0
+	for (k in PT) if (since(PT[k], now) >= TIMEOUT) late[++n] = k
+	for (i = 1; i <= n; i++) emit(late[i], "drop", via_of(late[i], ""))
+	# SYN без ClientHello - не TLS или старт до сбора; копить их незачем.
+	n = 0
+	for (k in SYNT) if (!(k in PT) && since(SYNT[k], now) > 60) late[++n] = k
+	for (i = 1; i <= n; i++) forget(late[i])
+	next
 }
 
 /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\./ {
-	if (!DONE) flush()
-	HEX = ""; SRC = ""; DONE = 0
-	TS = substr($1, 1, 8)
-	if ($2 == "IP") {
-		# 192.168.1.130.54321 - адрес это первые четыре октета
-		if (split($3, a, ".") >= 5) SRC = a[1] "." a[2] "." a[3] "." a[4]
-	} else if ($2 == "IP6") {
-		# fd6c:bfe7:e261::194.54321 - порт отделён последней точкой
-		SRC = $3
-		sub(/\.[0-9]+$/, "", SRC)
+	if (!DONE) classify()
+	HEX = ""; SA = ""; DA = ""; DONE = 0
+	TSF = $1
+	# "IP 192.168.1.130.54321 > 1.2.3.4.443: Flags ..." - порт после последней
+	# точки, у IPv6 так же.
+	if ($2 == "IP" || $2 == "IP6") {
+		SA = $3
+		DA = $5
+		sub(/:$/, "", DA)
 	}
 	next
 }
@@ -653,11 +801,17 @@ function flush(	ver, tcp, doff, p, n, sidl, csl, cml, extl, et, el, end, nl, nam
 	sub(/^[[:space:]]+0x[0-9a-f]+:[[:space:]]*/, "", line)
 	gsub(/[[:space:]]/, "", line)
 	HEX = HEX line
-	if (!DONE && flush()) DONE = 1
+	if (!DONE && classify()) DONE = 1
 	next
 }
 
-END { if (!DONE) flush() }
+# Сбор остановлен: ответа на эти ClientHello дождаться не успели.
+END {
+	if (!DONE) classify()
+	n = 0
+	for (k in PT) late[++n] = k
+	for (i = 1; i <= n; i++) emit(late[i], "-", via_of(late[i], ""))
+}
 DCATCH_SNI_AWK
 }
 
@@ -891,41 +1045,63 @@ nft_family() {
 	esac
 }
 
+# $1 - MAC или адрес, $2 - направление: src (пакеты клиента) или dst (ему).
 bpf_term() {
 	case "$1" in
-		??:??:??:??:??:??) printf 'ether src %s' "$1" ;;
-		*)                 printf 'src host %s' "$1" ;;
+		??:??:??:??:??:??) printf 'ether %s %s' "$2" "$1" ;;
+		*)                 printf '%s host %s' "$2" "$1" ;;
 	esac
 }
 
-# BPF-фильтр: только TLS ClientHello от нужных клиентов.
-build_bpf_filter() {
+# Отбор клиентов в одном направлении: $1 - режим, $2 - список, $3 - src|dst.
+bpf_hosts() {
 	BPF_HOSTS=""
-
 	if [ "$1" = "all" ]; then
 		for ONE in $(router_lan_ips); do
-			BPF_HOSTS="$BPF_HOSTS or src host $ONE"
+			BPF_HOSTS="$BPF_HOSTS or $3 host $ONE"
 		done
 		BPF_HOSTS="${BPF_HOSTS# or }"
 		[ -n "$BPF_HOSTS" ] && BPF_HOSTS="not ($BPF_HOSTS)"
 	else
 		for ONE in ${SELECTED_KEYS:-$2}; do
-			BPF_HOSTS="$BPF_HOSTS or $(bpf_term "$ONE")"
+			BPF_HOSTS="$BPF_HOSTS or $(bpf_term "$ONE" "$3")"
 		done
 		BPF_HOSTS="${BPF_HOSTS# or }"
 		[ -n "$BPF_HOSTS" ] && BPF_HOSTS="($BPF_HOSTS)"
 	fi
+	printf '%s\n' "$BPF_HOSTS"
+}
 
-	# Первый байт TCP-payload 0x16 = начало TLS-хендшейка. Для IPv6 через tcp[]
-	# нельзя - libpcap отвергает такой фильтр, - поэтому адресуемся от начала
-	# пакета: 40 байт фиксированного заголовка плюс длина TCP-заголовка.
-	BPF_BASE='((ip and tcp and tcp[((tcp[12:1]&0xf0)>>2)]=0x16) or (ip6 and tcp and ip6[40+((ip6[52]&0xf0)>>2)]=0x16))'
+# BPF-фильтр: от клиента - ClientHello, SYN на :443 и закрытие соединения;
+# клиенту - то, чем сервер отвечает на ClientHello: ServerHello, Alert, RST,
+# FIN, а также SYN-ACK с :443 ради RTT и TTL сервера.
+#
+# У tcp[] нет IPv6 - libpcap отвергает такой фильтр, - поэтому для IPv6
+# адресуемся от начала пакета: 40 байт заголовка, флаги TCP в ip6[53].
+#
+# Байт полезной нагрузки читаем только после проверки, что она есть: чтение за
+# концом пакета в BPF не "ложь", а отказ всему фильтру, и SYN-ACK без данных
+# отбрасывался бы целиком, даже подходя под соседнюю ветку. Скобки везде явные:
+# у and и or в pcap-filter одинаковый приоритет.
+build_bpf_filter() {
+	V4_DATA='(ip[2:2] - ((ip[0]&0xf)<<2) - ((tcp[12]&0xf0)>>2) > 0)'
+	V4_B0='tcp[((tcp[12]&0xf0)>>2)]'
+	V6_DATA='(ip6[4:2] - ((ip6[52]&0xf0)>>2) > 0)'
+	V6_B0='ip6[40+((ip6[52]&0xf0)>>2)]'
 
-	if [ -n "$BPF_HOSTS" ]; then
-		printf '%s and %s\n' "$BPF_BASE" "$BPF_HOSTS"
-	else
-		printf '%s\n' "$BPF_BASE"
-	fi
+	REQ4="(ip and tcp and ((tcp[13]&0x05 != 0) or (tcp[13]&0x12 = 0x02 and tcp dst port 443) or ($V4_DATA and $V4_B0 = 0x16)))"
+	REQ6="(ip6 and tcp and ((ip6[53]&0x05 != 0) or (ip6[53]&0x12 = 0x02 and tcp dst port 443) or ($V6_DATA and $V6_B0 = 0x16)))"
+	RESP4="(ip and tcp and ((tcp[13]&0x05 != 0) or (tcp[13]&0x12 = 0x12 and tcp src port 443) or ($V4_DATA and ($V4_B0 = 0x16 or $V4_B0 = 0x15))))"
+	RESP6="(ip6 and tcp and ((ip6[53]&0x05 != 0) or (ip6[53]&0x12 = 0x12 and tcp src port 443) or ($V6_DATA and (${V6_B0} = 0x16 or ${V6_B0} = 0x15))))"
+
+	REQ_HOSTS="$(bpf_hosts "$1" "$2" src)"
+	RESP_HOSTS="$(bpf_hosts "$1" "$2" dst)"
+
+	REQ="($REQ4 or $REQ6)"
+	RESP="($RESP4 or $RESP6)"
+	[ -n "$REQ_HOSTS" ] && REQ="($REQ and $REQ_HOSTS)"
+	[ -n "$RESP_HOSTS" ] && RESP="($RESP and $RESP_HOSTS)"
+	printf '%s or %s\n' "$REQ" "$RESP"
 }
 
 nft_guard_enable() {
@@ -1004,6 +1180,24 @@ nft_guard_disable() {
 	return 0
 }
 
+# Строка live-вывода: время, клиент, источник, $5 - исход рукопожатия, $6 - путь.
+# Цвет ставим вокруг уже выровненного поля: escape-коды внутри %-6s съели бы
+# ширину колонки.
+print_capture_line() {
+	TLS_LABEL="$5"
+	TLS_COLOR=""
+	case "$5" in
+		ok)            TLS_COLOR="$TUI_GREEN" ;;
+		drop|tspu)     TLS_COLOR="$TUI_RED" ;;
+		rst|alert|fin) TLS_COLOR="$TUI_YELLOW" ;;
+		abort|-)       TLS_COLOR="$TUI_DIM" ;;
+	esac
+	[ "$5" = "tspu" ] && TLS_LABEL="tspu?"
+	[ "$6" = "router" ] && TLS_LABEL="$TLS_LABEL*"
+	printf "%-8s %-${CLIENT_COL_W}s %-3s %s%-6s%s %s\n" \
+		"$1" "$2" "$3" "$TLS_COLOR" "$TLS_LABEL" "${TLS_COLOR:+$TUI_RESET}" "$4"
+}
+
 # Можно ли вообще начинать сбор по SNI. Проверяем до того, как трогать лог:
 # иначе отказ единственного источника уносил бы предыдущий сбор впустую.
 sni_available() {
@@ -1019,19 +1213,30 @@ sni_start() {
 
 	write_sni_awk
 	SNI_FILTER="$(build_bpf_filter "$1" "$2")"
-	rm -f "$SNI_PID_FILE" "$SNI_ERR_FILE"
+	rm -f "$SNI_PID_FILE" "$SNI_TICK_PID_FILE" "$SNI_ERR_FILE"
 
 	# Внутренний sh пишет свой PID и делает exec, поэтому в PID-файле оказывается
 	# именно tcpdump. stderr в файл, а не в /dev/null: при неудачном старте это
 	# единственный источник причины.
-	sh -c 'echo $$ > "$1"; exec tcpdump -i "$4" -nn -l -s 0 -x "$2" 2>"$3"' \
-		_ "$SNI_PID_FILE" "$SNI_FILTER" "$SNI_ERR_FILE" "$SNI_DEV" |
-		awk -f "$SNI_AWK_FILE" |
+	#
+	# Рядом в тот же канал пишет тикер: без него таймаут рукопожатия не сработал
+	# бы, пока tcpdump молчит. $$ в подоболочке - PID будущего tcpdump, так что
+	# тикер умирает вместе с ним. У sleep вывод закрыт, иначе он держал бы канал
+	# открытым ещё секунду после остановки и awk не видел бы конца потока.
+	sh -c 'echo $$ > "$1"
+		( while kill -0 $$ 2>/dev/null; do
+			sleep 1 </dev/null >/dev/null 2>&1
+			date "+TICK %H:%M:%S"
+		done ) &
+		echo $! > "$5"
+		exec tcpdump -i "$4" -nn -l -s 0 -x "$2" 2>"$3"' \
+		_ "$SNI_PID_FILE" "$SNI_FILTER" "$SNI_ERR_FILE" "$SNI_DEV" "$SNI_TICK_PID_FILE" |
+		awk -v TIMEOUT="$TLS_TIMEOUT" -f "$SNI_AWK_FILE" |
 		while IFS= read -r SNI_LINE; do
 			printf '%s\n' "$SNI_LINE" >> "$LOG_FILE"
 			# shellcheck disable=SC2086
 			set -- $SNI_LINE
-			printf "%-8s %-${CLIENT_COL_W}s %-3s %s\n" "$1" "$2" "$4" "$3"
+			print_capture_line "$1" "$2" "$4" "$3" "$5" "$6"
 		done &
 
 	SNI_ACTIVE="1"
@@ -1041,6 +1246,7 @@ sni_start() {
 	if [ ! -s "$SNI_PID_FILE" ] || ! kill -0 "$(cat "$SNI_PID_FILE")" 2>/dev/null; then
 		echo "Ошибка: tcpdump не запустился, SNI-источник недоступен."
 		[ -s "$SNI_ERR_FILE" ] && head -n 3 "$SNI_ERR_FILE"
+		stop_pid_file "$SNI_TICK_PID_FILE"
 		SNI_ACTIVE="0"
 		return 1
 	fi
@@ -1056,7 +1262,7 @@ dns_start() {
 			parse_query_line "$LINE" || continue
 			client_allowed "$1" "$2" || continue
 			printf '%s %s %s dns\n' "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN" >> "$LOG_FILE"
-			printf "%-8s %-${CLIENT_COL_W}s %-3s %s\n" "$CAP_TIME" "$CAP_CLIENT" "dns" "$CAP_DOMAIN"
+			print_capture_line "$CAP_TIME" "$CAP_CLIENT" "dns" "$CAP_DOMAIN" "" ""
 		done &
 
 	DNS_ACTIVE="1"
@@ -1075,7 +1281,10 @@ capture_stop_sources() {
 	STOP_NEEDED="0"
 	{ [ "$SNI_ACTIVE" = "1" ] || [ "$DNS_ACTIVE" = "1" ]; } && STOP_NEEDED="1"
 
-	[ "$SNI_ACTIVE" = "1" ] && stop_pid_file "$SNI_PID_FILE"
+	if [ "$SNI_ACTIVE" = "1" ]; then
+		stop_pid_file "$SNI_PID_FILE"
+		stop_pid_file "$SNI_TICK_PID_FILE"
+	fi
 	[ "$DNS_ACTIVE" = "1" ] && stop_pid_file "$DNS_PID_FILE"
 	SNI_ACTIVE="0"
 	DNS_ACTIVE="0"
@@ -1361,9 +1570,16 @@ capture_stream() {
 		fi
 	fi
 
-	# SRC перед доменом: домен последний, поэтому его длина никому не мешает.
-	printf "%-8s %-${CLIENT_COL_W}s %-3s %s\n" "TIME" "CLIENT_IP" "SRC" "DOMAIN"
-	printf '%s %s %s %s\n' "$(dashes 8)" "$(dashes "$CLIENT_COL_W")" "---" "$(dashes 40)"
+	if [ "$CAPTURE_SOURCE" != "dns" ]; then
+		tui_hint "TLS: ok - прошло, drop - нет ответа ${TLS_TIMEOUT} с, rst - сброс, tspu? - сброс похож на ТСПУ,"
+		tui_hint "     alert - отказ сервера, fin - закрыто без ответа, abort - клиент закрыл сам,"
+		tui_hint "     * - соединение принял прокси на роутере. Строка SNI появляется, когда исход известен."
+		echo
+	fi
+
+	# SRC и TLS перед доменом: домен последний, поэтому его длина никому не мешает.
+	printf "%-8s %-${CLIENT_COL_W}s %-3s %-6s %s\n" "TIME" "CLIENT_IP" "SRC" "TLS" "DOMAIN"
+	printf '%s %s %s %s %s\n' "$(dashes 8)" "$(dashes "$CLIENT_COL_W")" "---" "$(dashes 6)" "$(dashes 40)"
 
 	SNI_STARTED="0"
 	if [ "$CAPTURE_SOURCE" != "dns" ]; then
@@ -1429,6 +1645,34 @@ print_unique_domains() {
 	fi
 	tui_block "Уникальные домены" "Найдено: $(awk '{print $3}' "$LOG_FILE" | sort -u | wc -l | tr -d ' ')" open
 	awk '{print $3}' "$LOG_FILE" | sort -u
+	print_tls_problems
+	return 0
+}
+
+# Домены, у которых хоть одно рукопожатие не прошло, со счётом по исходам.
+# abort и "-" не проблема сети - их не считаем. Строки DNS и лог старого
+# формата без статуса пропускаются сами.
+print_tls_problems() {
+	TLS_PROBLEMS="$(awk '
+		$4 == "sni" && NF >= 5 && $5 != "-" && $5 != "abort" {
+			N[$3 " " $5]++
+			if ($5 != "ok") BAD[$3] = 1
+			if ($6 == "router") VIA[$3] = 1
+		}
+		END {
+			split("ok drop tspu rst alert fin", ORDER, " ")
+			for (d in BAD) {
+				s = ""
+				for (i = 1; i <= 6; i++) {
+					k = d " " ORDER[i]
+					if (k in N) s = s (s == "" ? "" : ", ") (ORDER[i] == "tspu" ? "tspu?" : ORDER[i]) " " N[k]
+				}
+				printf "%-40s %s%s\n", d, s, (d in VIA ? "  *" : "")
+			}
+		}' "$LOG_FILE" | sort)"
+	[ -z "$TLS_PROBLEMS" ] && return 0
+	tui_block "Рукопожатия с проблемами" "Найдено: $(printf '%s\n' "$TLS_PROBLEMS" | wc -l | tr -d ' ')   * - шло через прокси на роутере" open
+	printf '%s\n' "$TLS_PROBLEMS"
 	return 0
 }
 
@@ -1545,6 +1789,7 @@ cleanup() {
 
 	# Оба источника: после жёсткого обрыва здесь может висеть и logread.
 	stop_pid_file "$SNI_PID_FILE"
+	stop_pid_file "$SNI_TICK_PID_FILE"
 	stop_pid_file "$DNS_PID_FILE"
 
 	# Глобов вроде /tmp/*dns*.log здесь быть не должно: ни один файл утилиты под
