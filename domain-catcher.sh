@@ -16,7 +16,7 @@ SNI_ERR_FILE="/tmp/domain-catcher.tcpdump.err"
 DNS_PID_FILE="/tmp/domain-catcher.logread.pid"
 NFT_FILE="/tmp/domain-catcher.nft"
 TTY_DEV="/dev/tty"
-DCATCH_VERSION="0.6.0-beta"
+DCATCH_VERSION="0.6.1-beta"
 
 # Обновляемся по последнему релизу, а не по ветке: в ветку попадает и работа
 # в процессе. DCATCH_SCRIPT_URL перекрывает всё и берёт файл напрямую.
@@ -1194,7 +1194,7 @@ print_capture_line() {
 	esac
 	[ "$5" = "tspu" ] && TLS_LABEL="tspu?"
 	[ "$6" = "router" ] && TLS_LABEL="$TLS_LABEL*"
-	printf "%-8s %-${CLIENT_COL_W}s %-3s %s%-6s%s %s\n" \
+	printf "%-8s %-${CLIENT_COL_W}s %-9s %s%-6s%s %s\n" \
 		"$1" "$2" "$3" "$TLS_COLOR" "$TLS_LABEL" "${TLS_COLOR:+$TUI_RESET}" "$4"
 }
 
@@ -1261,8 +1261,8 @@ dns_start() {
 		while IFS= read -r LINE; do
 			parse_query_line "$LINE" || continue
 			client_allowed "$1" "$2" || continue
-			printf '%s %s %s dns\n' "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN" >> "$LOG_FILE"
-			print_capture_line "$CAP_TIME" "$CAP_CLIENT" "dns" "$CAP_DOMAIN" "" ""
+			printf '%s %s %s dns/%s\n' "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN" "$CAP_TYPE" >> "$LOG_FILE"
+			print_capture_line "$CAP_TIME" "$CAP_CLIENT" "dns/$CAP_TYPE" "$CAP_DOMAIN" "" ""
 		done &
 
 	DNS_ACTIVE="1"
@@ -1463,7 +1463,7 @@ configure_capture_advanced() {
 }
 
 parse_query_line() {
-	CAP_TIME=""; CAP_DOMAIN=""; CAP_CLIENT=""
+	CAP_TIME=""; CAP_DOMAIN=""; CAP_CLIENT=""; CAP_TYPE=""
 	WANT_DOMAIN="0"; WANT_CLIENT="0"
 
 	for WORD in $1; do
@@ -1475,7 +1475,13 @@ parse_query_line() {
 		fi
 		case "$WORD" in
 			[0-9][0-9]:[0-9][0-9]:[0-9][0-9]) [ -z "$CAP_TIME" ] && CAP_TIME="$WORD" ;;
-			query\[*\]) WANT_DOMAIN="1" ;;
+			# query[AAAA] -> AAAA. "?" вместо скобок: в шаблоне их пришлось бы
+			# экранировать, а ash и bash понимают это экранирование по-разному.
+			query\[*\])
+				CAP_TYPE="${WORD#query?}"
+				CAP_TYPE="${CAP_TYPE%?}"
+				WANT_DOMAIN="1"
+				;;
 			from) WANT_CLIENT="1" ;;
 		esac
 	done
@@ -1571,8 +1577,8 @@ capture_stream() {
 	fi
 
 	# SRC и TLS перед доменом: домен последний, поэтому его длина никому не мешает.
-	printf "%-8s %-${CLIENT_COL_W}s %-3s %-6s %s\n" "TIME" "CLIENT_IP" "SRC" "TLS" "DOMAIN"
-	printf '%s %s %s %s %s\n' "$(dashes 8)" "$(dashes "$CLIENT_COL_W")" "---" "$(dashes 6)" "$(dashes 40)"
+	printf "%-8s %-${CLIENT_COL_W}s %-9s %-6s %s\n" "TIME" "CLIENT_IP" "SRC" "TLS" "DOMAIN"
+	printf '%s %s %s %s %s\n' "$(dashes 8)" "$(dashes "$CLIENT_COL_W")" "$(dashes 9)" "$(dashes 6)" "$(dashes 40)"
 
 	SNI_STARTED="0"
 	if [ "$CAPTURE_SOURCE" != "dns" ]; then

@@ -2,7 +2,7 @@
 
 ![OpenWrt](https://img.shields.io/badge/OpenWrt-BusyBox%20ash-00B5E2)
 ![Dependencies](https://img.shields.io/badge/dependencies-tcpdump--mini%20%2B%20nft-orange)
-![Version](https://img.shields.io/badge/version-0.6.0--beta-blue)
+![Version](https://img.shields.io/badge/version-0.6.1--beta-blue)
 
 SSH-утилита для OpenWrt: показывает, к каким доменам обращается устройство в сети,
 чтобы добавить их в правила раздельной маршрутизации - PassWall2, Podkop, NetShift
@@ -89,12 +89,13 @@ wget -O /usr/bin/.dcatch.new https://raw.githubusercontent.com/doxfie/Domain-Cat
 какие домены режутся и их пора отправлять в туннель:
 
 ```text
-TIME     CLIENT_IP       SRC TLS    DOMAIN
--------- --------------- --- ------ ----------------------------------------
-18:54:22 192.168.1.130   sni ok     www.google.com
-18:54:22 192.168.1.130   sni ok*    rutracker.org
-18:54:26 192.168.1.130   sni drop   blocked.example
-18:54:26 192.168.1.130   dns        youtube.com
+TIME     CLIENT_IP       SRC       TLS    DOMAIN
+-------- --------------- --------- ------ ----------------------------------------
+18:54:22 192.168.1.130   dns/A            www.google.com
+18:54:22 192.168.1.130   dns/AAAA         www.google.com
+18:54:22 192.168.1.130   sni       ok     www.google.com
+18:54:22 192.168.1.130   sni       ok*    rutracker.org
+18:54:26 192.168.1.130   sni       drop   blocked.example
 ```
 
 | Статус | Что произошло |
@@ -133,7 +134,10 @@ DCATCH_TLS_TIMEOUT=10 dcatch
 ## 📝 Лог
 
 `/tmp/domain-catcher.log`, формат `HH:MM:SS IP DOMAIN SRC [TLS VIA]`, где `SRC` -
-`dns` или `sni`. У строк SNI ещё два поля: `TLS` - статус из таблицы выше
+`sni` или `dns/<тип записи>`: `dns/A`, `dns/AAAA`, `dns/HTTPS` и так далее. Один
+домен обычно запрашивается сразу несколькими типами, поэтому строк DNS на него
+несколько. Колонка клиента при этом показывает адрес, с которого пришёл запрос, а
+не версию запрошенного адреса. У строк SNI ещё два поля: `TLS` - статус из таблицы выше
 (подмена записана как `tspu`), `VIA` - `router`, `direct` или `-`. Домен
 по-прежнему третье поле. `dnsmasq logqueries` включается только на время сбора и
 возвращается в исходное состояние.
